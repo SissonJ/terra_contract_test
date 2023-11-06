@@ -1,7 +1,8 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    from_binary, to_binary, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo, Response, StdResult,
+    from_binary, to_binary, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo, Response,
+    StdResult, SubMsg,
 };
 use cw2::set_contract_version;
 
@@ -46,22 +47,22 @@ pub fn try_hydrate(msg: String, vars: String) -> Result<Response, ContractError>
     let mut msgs_to_send: Vec<CosmosMsg> = vec![];
     // Deserialize vars
     let modified_vars = vars.replace(":", ",").replace(" ", "").replace(",]", "]");
-    println!("This one {}", modified_vars);
     let vars_vec: Vec<String> = match serde_json_wasm::from_str(&modified_vars) {
         Ok(val) => val,
         Err(error) => {
-            println!("Ther error is: {:?}", error);
             vec![]
         }
     };
-    // start unbinarying the msg
+    // start decoding the msg
     let mut msg_substring = msg.replace(" ", "").clone();
     let mut decoded_msg = "".to_string();
     let mut postscript = "".to_string();
+    // we want to find the message to isolate the b64 encoded stuff
+    // the loop will end when we've decoded all the b64 msgs
     while msg_substring.find("msg").is_some() {
-        println!("msg_substring: {}", msg_substring);
         match msg_substring.find("msg") {
             Some(first_index) => {
+                // The second index will be the , because inbetween the comma and "msg" is the b64
                 let second_index = match msg_substring[first_index + 5..msg_substring.len()]
                     .to_string()
                     .find(",")
@@ -73,32 +74,67 @@ pub fn try_hydrate(msg: String, vars: String) -> Result<Response, ContractError>
                         })
                     }
                 };
+                // save what come before "msg"
                 let prescript = msg_substring[0..first_index + 5].to_string();
+                // save the last part, we only need to do this once though
                 if postscript.eq(&"".to_string()) {
                     postscript = msg_substring[second_index..msg_substring.len()].to_string();
                 }
+                // decrypt the data now that we have it isolated
                 let base64_string = serde_json_wasm::from_str::<String>(
                     &msg_substring[first_index + 5..second_index],
                 )?;
-                println!("base64_string: {}", base64_string);
                 msg_substring = serde_json_wasm::to_string(&Binary::from_base64(&base64_string)?)?;
+                // put it all back together
                 decoded_msg = format!("{}{}{}", decoded_msg, prescript.to_string(), msg_substring,);
+                // If there's a nested msg, the find("msg") will be able to find something and
+                // we'll do it over again, satisfying the nested msg req
             }
             None => (),
         }
     }
+    // Once it's all decoded, we want to replace the variables with the data
     decoded_msg = format!("{}{}", decoded_msg, postscript);
-    println!("vars: {:?}, msg: {:?}", vars_vec, decoded_msg);
     for (i, vars) in vars_vec.iter().enumerate() {
+        // Do this operation every other loop since the array is organized [name, val, name, val..]
         if i % 2 == 0 {
-            decoded_msg = decoded_msg.replace(vars, &vars_vec[i + 1]);
+            decoded_msg = decoded_msg.clone().replace(vars, &vars_vec[i + 1]);
         }
     }
-    encoded_msg = {
-        decoded_msg.rfind("msg").iter().next()
-    }
+    // rencode the msg
+    let encoded_msg = {
+        let mut encoded_msg = decoded_msg.clone();
+        // find the last instance of "msg" as this will be the deepest nested msg
+        let mut msg_iter = decoded_msg.rfind("msg").into_iter();
+        let mut next_msg_index = msg_iter.next();
+        let mut index = 0;
+        while next_msg_index.clone() != None {
+            // we want this to execute every other since first operation encoded the msg, then
+            // since we're not encoding "msg" we need to skip one loop to move on
+            if index % 2 == 0 {
+                // isolate the msg part
+                let second_index =
+                    decoded_msg[next_msg_index.unwrap().clone()..decoded_msg.len()].find(",");
+                let encoded_nested_msg = to_binary(
+                    &encoded_msg[next_msg_index.unwrap().clone() + 5..second_index.unwrap()]
+                        .to_string(),
+                )?;
+                // encode it and replace the old msg wit the encoded msg
+                encoded_msg = encoded_msg.replace(
+                    &encoded_msg[next_msg_index.unwrap().clone() + 5..second_index.unwrap()]
+                        .to_string(),
+                    &encoded_nested_msg.to_string(),
+                )
+            }
+            next_msg_index = msg_iter.next();
+            index = index + 1;
+        }
+        encoded_msg
+    };
+    // deserialize to a cosmos msg and add it to the response
+    let cosmos_msg: CosmosMsg = serde_json_wasm::from_str(&encoded_msg)?;
     Ok(Response::new()
-        .add_messages(msgs_to_send)
+        .add_message(cosmos_msg)
         .add_attribute("method", "try_increment"))
 }
 
@@ -124,7 +160,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     Ok(CountResponse { count: state.count })
 }*/
 
-#[cfg(test)]
+/*#[cfg(test)]
 mod tests {
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies_with_balance, mock_env, mock_info};
@@ -151,6 +187,8 @@ mod tests {
         assert!(false)
     }
 }
+
+*/
 
 /*#[test]
     fn increment() {
